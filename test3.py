@@ -74,6 +74,7 @@ def replace_text(text: str, mapping: Dict[str, Any]) -> str:
         return str(mapping.get(key, m.group(0)))
 
     return PATTERN.sub(repl, text)
+
 def _process_group_shape(group, mapping: Dict[str, Any]):
     """递归处理组合形状，保留格式"""
     try:
@@ -87,6 +88,7 @@ def _process_group_shape(group, mapping: Dict[str, Any]):
                 _process_group_shape(shape, mapping)
     except Exception as e:
         print(f"处理组合形状时出错: {e}")
+
 def process_slide_text(slide, mapping: Dict[str, Any]):
     """处理幻灯片文本，保留原始格式"""
     print(f"\n===== 开始处理幻灯片文本 =====")
@@ -170,68 +172,132 @@ def _copy_bg(src_cSld, dst_cSld):
     print("背景已复制到目标幻灯片")
 
 
+def _copy_all_image_relationships(src_part, dst_slide):
+    """
+    复制源部件中的所有图片关系到目标幻灯片
+    """
+    print(f"\n===== 开始复制图片关系 =====")
+    
+    src_rels = src_part._rels
+    dst_part = dst_slide.part
+    
+    # 获取所有图片关系
+    image_rels = []
+    for rel_id, rel in src_rels.items():
+        if rel.reltype == RT.IMAGE:
+            image_rels.append((rel_id, rel))
+    
+    print(f"源部件中发现 {len(image_rels)} 个图片关系")
+    
+    # 创建关系ID映射
+    rid_mapping = {}
+    
+    for old_rid, rel in image_rels:
+        try:
+            # 获取图片数据
+            img_blob = rel.target_part.blob
+            if not img_blob:
+                print(f"图片 {old_rid} 没有数据，跳过")
+                continue
+            
+            # 获取图片内容类型
+            content_type = rel.target_part.content_type
+            
+            print(f"复制图片 {old_rid}，内容类型: {content_type}")
+            
+            # 创建新的图片部件
+            image_part = dst_part.package.get_or_add_image_part(img_blob)
+            
+            # 在目标幻灯片中添加关系
+            new_rid = dst_part._rels.get_or_add_ext_rel(RT.IMAGE, image_part)
+            
+            rid_mapping[old_rid] = new_rid
+            print(f"图片关系映射: {old_rid} -> {new_rid}")
+            
+        except Exception as e:
+            print(f"复制图片关系 {old_rid} 时出错: {e}")
+            continue
+    
+    print(f"成功复制 {len(rid_mapping)} 个图片关系")
+    return rid_mapping
+
+
+def _update_image_references(element, rid_mapping):
+    """
+    更新元素中的所有图片引用
+    """
+    print(f"\n===== 开始更新图片引用 =====")
+    
+    # 查找所有图片引用
+    blips = element.xpath(".//a:blip[@r:embed]")
+    chart_refs = element.xpath(".//c:externalData[@r:id]")
+    ole_refs = element.xpath(".//p:oleObj[@r:id]")
+    
+    total_refs = len(blips) + len(chart_refs) + len(ole_refs)
+    print(f"发现 {total_refs} 个图片引用需要更新")
+    
+    updated_count = 0
+    
+    # 更新 a:blip 引用
+    for blip in blips:
+        old_rid = blip.get(qn("r:embed"))
+        if old_rid in rid_mapping:
+            new_rid = rid_mapping[old_rid]
+            blip.set(qn("r:embed"), new_rid)
+            print(f"更新 blip 引用: {old_rid} -> {new_rid}")
+            updated_count += 1
+    
+    # 更新图表引用
+    for chart_ref in chart_refs:
+        old_rid = chart_ref.get(qn("r:id"))
+        if old_rid in rid_mapping:
+            new_rid = rid_mapping[old_rid]
+            chart_ref.set(qn("r:id"), new_rid)
+            print(f"更新图表引用: {old_rid} -> {new_rid}")
+            updated_count += 1
+    
+    # 更新 OLE 对象引用
+    for ole_ref in ole_refs:
+        old_rid = ole_ref.get(qn("r:id"))
+        if old_rid in rid_mapping:
+            new_rid = rid_mapping[old_rid]
+            ole_ref.set(qn("r:id"), new_rid)
+            print(f"更新 OLE 引用: {old_rid} -> {new_rid}")
+            updated_count += 1
+    
+    print(f"成功更新 {updated_count} 个图片引用")
+
+
 def _fix_blip_rids(src_part, dst_slide):
     """
-    确保 dst_slide 内所有 <a:blip> 引用的 rId 都存在；若缺失，则复制图片并更新 rId
+    修复图片引用：复制所有图片关系并更新引用
     """
-    # 查找目标幻灯片中的所有 <a:blip> 元素
-    blips = dst_slide.element.xpath(".//a:blip")
-
-    print(f"目标幻灯片中发现 {len(blips)} 张图片")
-
-    if not blips:
-        print("目标幻灯片中没有图片，跳过处理")
-        return
-
-    dst_rels = dst_slide.part._rels
-    src_rels = src_part._rels
-
-    # 遍历每个 <a:blip> 标签
-    for i, blip in enumerate(blips):
-        old_rid = blip.get(qn("r:embed"))
-
-        # 打印调试信息：每个图片的 rId
-        print(f"处理第 {i + 1} 张图片，rId 为: {old_rid}")
-
-        # 如果 rId 为 None，生成一个新的唯一 rId
-        if old_rid is None:
-            old_rid = f"new_rId_{i}"
-            print(f"图片 {i + 1} 的 rId 为 None，生成新 rId: {old_rid}")
-
-        # 获取源幻灯片中的关系
-        rel = src_rels.get(old_rid)
-
-        if rel is None:
-            print(f"未找到 rId {old_rid} 的关系，跳过")
-            continue
-
-        # 确保这是图像类型
-        if rel.reltype != RT.IMAGE:
-            print(f"rId {old_rid} 不是图像类型，跳过")
-            continue
-
-        # 获取图片数据
-        img_blob = rel.target_part.blob
-        if not img_blob:
-            print(f"图片 {old_rid} 没有图像数据，跳过")
-            continue
-
-        print(f"找到图像 {old_rid}，正在复制到目标幻灯片")
-
-        # 获取图片文件名（提取图片路径中的文件名）
-        image_filename = os.path.basename(rel.target_part.partname)
-        print(f"图片文件名: {image_filename}")
-
-        # 复制图片并获取新的 rId
-        _, new_rid = dst_slide.part.get_or_add_image_part(BytesIO(img_blob))
-
-        # 更新目标幻灯片中的图片 rId
-        blip.set(qn("r:embed"), new_rid)
-        print(f"已更新 rId 为 {new_rid}，图像文件名: {image_filename}")
+    print(f"\n===== 开始修复图片引用 =====")
+    print(f"源部件类型: {type(src_part).__name__}")
+    
+    try:
+        # 复制所有图片关系
+        rid_mapping = _copy_all_image_relationships(src_part, dst_slide)
+        
+        if not rid_mapping:
+            print("没有图片关系需要复制")
+            return
+        
+        # 更新目标幻灯片中的所有图片引用
+        _update_image_references(dst_slide.element, rid_mapping)
+        
+        print("图片引用修复完成")
+        
+    except Exception as e:
+        print(f"修复图片引用时出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 # --------------------- 幻灯片克隆 ------------------- #
 def clone_slide(dst_prs: Presentation, src_slide):
     """三层克隆：幻灯片自身 + 版式 + 母版"""
+    print(f"\n===== 开始克隆幻灯片 =====")
+    
     blank_layout = dst_prs.slide_layouts[6]        # 空白
     dst_slide = dst_prs.slides.add_slide(blank_layout)
 
@@ -240,26 +306,36 @@ def clone_slide(dst_prs: Presentation, src_slide):
     dst_cSld.remove(dst_spTree)                    # 去掉空白 spTree
 
     # ----- 幻灯片层 ----- #
+    print("复制幻灯片层内容...")
     src_cSld = src_slide.element.xpath("./p:cSld")[0]
     dst_cSld.append(deepcopy(src_cSld.xpath("./p:spTree")[0]))
     _copy_bg(src_cSld, dst_cSld)
 
     # ----- 版式层 ----- #
+    print("复制版式层内容...")
     layout      = src_slide.slide_layout
     layout_cSld = layout.element.xpath("./p:cSld")[0]
     _copy_non_placeholder_shapes(layout_cSld, dst_cSld.xpath("./p:spTree")[0])
     _copy_bg(layout_cSld, dst_cSld)
 
     # ----- 母版层 ----- #
+    print("复制母版层内容...")
     master      = layout.slide_master
     master_cSld = master.element.xpath("./p:cSld")[0]
     _copy_non_placeholder_shapes(master_cSld, dst_cSld.xpath("./p:spTree")[0])
     _copy_bg(master_cSld, dst_cSld)
 
-    # ----- 修正图片关系 ----- #
+    # ----- 修正图片关系（按优先级顺序） ----- #
+    print("修复图片关系...")
+    
+    # 1. 首先处理幻灯片本身的图片
     _fix_blip_rids(src_slide.part, dst_slide)
-    _fix_blip_rids(layout.part,    dst_slide)
-    _fix_blip_rids(master.part,    dst_slide)
+    
+    # 2. 然后处理版式层的图片
+    _fix_blip_rids(layout.part, dst_slide)
+    
+    # 3. 最后处理母版层的图片
+    _fix_blip_rids(master.part, dst_slide)
 
     # 返回新幻灯片索引
     slide_index = len(dst_prs.slides) - 1
